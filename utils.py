@@ -5,17 +5,30 @@
 # Quantum Computing IBM       #
 ###############################
 
+# -*- coding: utf-8 -*-
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import StrMethodFormatter
+from scipy.stats import norm as _norm
+from scipy.stats import t as _t
+from scipy.optimize import minimize
+# GARCH (arch)
+try:
+    from arch.univariate import ConstantMean, GARCH, Normal, StudentsT
+    _HAS_ARCH = True
+except Exception:
+    _HAS_ARCH = False
 # Optional SciPy for parametric VaR/CVaR
 try:
     from scipy.stats import norm
 except Exception:
     norm = None
+from scipy.stats import gaussian_kde
+from scipy.interpolate import UnivariateSpline
 ##########################################    
 #NEW: AUTHOMATIC FINANCIAL COMMENTARY!   #
 ##########################################
@@ -188,7 +201,7 @@ def _extract_close(df, tickers):
 
     if isinstance(df.columns, pd.MultiIndex):
         lvl0 = df.columns.get_level_values(0)
-        if "Close" in lvl0:
+        if "Close" in lvl0: 
             out = df.xs("Close", axis=1, level=0)
         elif "Adj Close" in lvl0:
             out = df.xs("Adj Close", axis=1, level=0)
@@ -275,7 +288,7 @@ def download_analyze_with_metrics(
         bm = _compute_returns(bm_px.to_frame(), method=return_method).iloc[:, 0]
         bm = bm.reindex(px.index).rename("bm_return")
 
-    # --- 6) Metrics per ticker (igual que antes; recorta a kept_tickers)
+    # --- 6) 
     metrics = []
     rf_daily = (1 + rf_annual) ** (1 / periods_per_year) - 1
 
@@ -424,17 +437,6 @@ def download_analyze_with_metrics(
             commentary = f"(Commentary generation failed: {e})"
 
     return panel, summary, extras, commentary
-
-def save_commentary_markdown(commentary: str, path: str = "commentary.md", title: str = "Analysis Commentary"):
-    """
-    Save the generated commentary to a Markdown file.
-    """
-    if not isinstance(commentary, str) or not commentary.strip():
-        raise ValueError("Empty commentary.")
-    md = f"# {title}\n\n{commentary}\n"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(md)
-    return path
 
 # -----------------------------
 # Helpers: detect & reshape
@@ -653,4 +655,424 @@ def plot_returns(data: pd.DataFrame,
     ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, title="Ticker")
     fig.autofmt_xdate()
     plt.tight_layout()
+    plt.show()
+
+# -------------------- metrics helper --------------------
+def _ll_aic_bic(loglik: float, n_params: int, n_obs: int) -> dict:
+    """
+    Compute log-likelihood, AIC, and BIC for model comparison.
+    """
+    aic = 2 * n_params - 2 * loglik
+    bic = n_params * np.log(n_obs) - 2 * loglik
+    return {"loglik": float(loglik), "aic": float(aic), "bic": float(bic)}
+
+
+# -------------------- Normal fit --------------------
+def fit_normal(returns: pd.Series) -> dict:
+    """
+    Gaussian MLE with closed-form estimates:
+        mu = sample mean
+        sigma = sample std with ddof=0 (MLE)
+    Returns a dict with parameters and information criteria.
+    """
+    r = pd.Series(returns).dropna().values
+    if r.size < 3:
+        raise ValueError("Too few observations to fit a Normal model.")
+    mu = float(r.mean())
+    sigma = float(r.std(ddof=0))
+    if sigma <= 0:
+        raise ValueError("Zero variance; cannot fit a Normal model.")
+
+    ll = _norm.logpdf(r, loc=mu, scale=sigma).sum()
+    out = {"model": "normal", "mu": mu, "sigma": sigma}
+    out.update(_ll_aic_bic(ll, n_params=2, n_obs=r.size))
+    return out
+
+
+# -------------------- Student-t fit --------------------
+def fit_tstudent(returns: pd.Series, nu_lower: float = 2.01) -> dict:
+    """
+    Student-t MLE: estimates df (nu), location (mu), and scale (sigma).
+    We enforce nu > nu_lower (default 2.01) so that variance is finite.
+
+    Optimization is done on transformed parameters to keep constraints:
+        nu = nu_lower + exp(nu_raw) > nu_lower
+        sigma = exp(log_sigma) > 0
+    """
+    r = pd.Series(returns).dropna().values
+    if r.size < 5:
+        raise ValueError("Too few observations to fit a Student-t model.")
+
+    def nll(params):
+        # params = [nu_raw, mu, log_sigma]
+        nu = nu_lower + np.exp(params[0])
+        mu = params[1]
+        sigma = np.exp(params[2])
+        return -_t.logpdf(r, df=nu, loc=mu, scale=sigma).sum()
+
+    # Initialize from Normal MLE
+    mu0 = r.mean()
+    sigma0 = r.std(ddof=0)
+    x0 = np.array([np.log(5.0 - nu_lower), mu0, np.log(sigma0 if sigma0 > 0 else 1e-6)])
+
+    res = minimize(nll, x0=x0, method="L-BFGS-B")
+    if not res.success:
+        raise RuntimeError(f"Student-t fit failed to converge: {res.message}")
+
+    nu = nu_lower + np.exp(res.x[0])
+    mu = res.x[1]
+    sigma = np.exp(res.x[2])
+
+    ll = -res.fun
+    out = {"model": "t", "nu": float(nu), "mu": float(mu), "sigma": float(sigma)}
+    out.update(_ll_aic_bic(ll, n_params=3, n_obs=r.size))
+    return out
+
+
+# -------------------- GARCH(1,1) fit --------------------
+def fit_garch(
+    returns: pd.Series,
+    dist: str = "normal",        # "normal" or "t"
+    scale_100: bool = True,      # multiply by 100 for numerical stability (common in 'arch')
+    mean: str = "constant"       # "constant" or "zero" (here we keep ConstantMean for both)
+) -> dict:
+    """
+    Fit a GARCH(1,1) to returns and return model parameters + diagnostics.
+
+    Returned keys:
+        - model: "garch(1,1)-normal" or "garch(1,1)-t"
+        - mu, omega, alpha1, beta1, (nu if t)
+        - loglik, aic, bic, n_obs, converged
+        - uncond_var (if alpha+beta<1), else NaN
+    """
+    if not _HAS_ARCH:
+        raise ImportError("Package 'arch' not available. Install with: pip install arch")
+
+    r = pd.Series(returns).dropna()
+    if r.size < 50:
+        raise ValueError("Too few observations for GARCH (need ~50+).")
+
+    # Scale by 100 if requested (common practice with 'arch')
+    scale = 100.0 if scale_100 else 1.0
+    y = r.values * scale
+
+    am = ConstantMean(y)  # if you want zero-mean, set am = ZeroMean(y)
+    am.volatility = GARCH(p=1, q=1)
+
+    if dist.lower() == "normal":
+        am.distribution = Normal()
+    elif dist.lower() in {"t", "student", "students_t"}:
+        am.distribution = StudentsT()
+    else:
+        raise ValueError("dist must be 'normal' or 't'.")
+
+    res = am.fit(disp="off")
+    params = res.params.to_dict()
+
+    mapped = {
+        "model": f"garch(1,1)-{dist.lower()}",
+        # 'mu' is on the scaled space; rescale back to original returns
+        "mu": float(params.get("mu", 0.0)) / scale,
+        "omega": float(params.get("omega")),
+        "alpha1": float(params.get("alpha[1]", params.get("alpha1", np.nan))),
+        "beta1": float(params.get("beta[1]", params.get("beta1", np.nan))),
+    }
+    if dist.lower() in {"t", "student", "students_t"}:
+        mapped["nu"] = float(params.get("nu", np.nan))
+
+    out = dict(mapped)
+    out.update({
+        "loglik": float(res.loglikelihood),
+        "aic": float(res.aic),
+        "bic": float(res.bic),
+        "n_obs": int(res.nobs),
+        "converged": bool(res.convergence_flag == 0)
+    })
+
+    # Unconditional variance: omega / (1 - alpha - beta) when stationary
+    alpha = mapped["alpha1"]
+    beta = mapped["beta1"]
+    if np.isfinite(alpha) and np.isfinite(beta) and (alpha + beta) < 0.9999:
+        out["uncond_var"] = float(mapped["omega"] / max(1e-12, (1.0 - alpha - beta)))
+    else:
+        out["uncond_var"] = np.nan
+
+    return out
+
+
+# -------------------- plotting helpers --------------------
+def plot_hist_with_pdf_normal_t(returns: pd.Series,
+                                fit_normal_dict: dict,
+                                fit_t_dict: dict,
+                                bins: int = 60,
+                                title: str = "Histogram with Normal & Student-t fits"):
+    """
+    Plot a histogram of returns with fitted Normal and Student-t PDFs overlaid.
+    This is appropriate for i.i.d. models.
+    """
+    r = pd.Series(returns).dropna().values
+    if r.size == 0:
+        raise ValueError("No valid returns to plot.")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.hist(r, bins=bins, density=True, alpha=0.35, label="Returns")
+
+    xs = np.linspace(np.percentile(r, 0.1), np.percentile(r, 99.9), 1000)
+
+    # Normal PDF
+    muN, sdN = fit_normal_dict["mu"], fit_normal_dict["sigma"]
+    ax.plot(xs, _norm.pdf(xs, loc=muN, scale=sdN), linewidth=2.0, label="Normal fit")
+
+    # Student-t PDF
+    nuT, muT, sdT = fit_t_dict["nu"], fit_t_dict["mu"], fit_t_dict["sigma"]
+    ax.plot(xs, _t.pdf(xs, df=nuT, loc=muT, scale=sdT), linewidth=2.0,
+            label=f"Student-t fit (ν≈{nuT:.1f})")
+
+    ax.set_title(title)
+    ax.set_xlabel("Return")
+    ax.set_ylabel("Density")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    plt.show()
+
+
+def plot_hist_stdres_garch(returns: pd.Series,
+                           dist: str,
+                           bins: int = 60,
+                           title: str | None = None,
+                           scale_100: bool = True):
+    """
+    For GARCH models, the right diagnostic is to compare the histogram of
+    standardized residuals with the assumed innovation distribution (Normal or t).
+    We refit a GARCH(1,1) with the requested innovation and then plot.
+
+    NOTE: This function re-fits the model to compute standardized residuals to
+    keep the interface simple. If you already have a fitted result, you could
+    pass the residuals directly instead.
+    """
+    if not _HAS_ARCH:
+        raise ImportError("Package 'arch' not available. Install with: pip install arch")
+
+    r = pd.Series(returns).dropna()
+    if r.empty:
+        raise ValueError("No valid returns to plot standardized residuals.")
+
+    scale = 100.0 if scale_100 else 1.0
+    y = r.values * scale
+
+    am = ConstantMean(y)
+    am.volatility = GARCH(p=1, q=1)
+    if dist.lower() == "normal":
+        am.distribution = Normal()
+    else:
+        am.distribution = StudentsT()
+    res = am.fit(disp="off")
+
+    z = pd.Series(res.std_resid).dropna().values
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.hist(z, bins=bins, density=True, alpha=0.35, label="Standardized residuals")
+
+    xs = np.linspace(np.percentile(z, 0.1), np.percentile(z, 99.9), 1000)
+    if dist.lower() == "normal":
+        ax.plot(xs, _norm.pdf(xs, loc=0, scale=1), linewidth=2.0, label="N(0,1)")
+    else:
+        # Use fitted 'nu' if available; fallback to quick fit on z
+        try:
+            nu = float(res.params.get("nu", np.nan))
+        except Exception:
+            nu = np.nan
+        if not np.isfinite(nu):
+            nu = max(2.01, _t.fit(z, floc=0, fscale=1)[0])
+        ax.plot(xs, _t.pdf(xs, df=nu, loc=0, scale=1), linewidth=2.0, label=f"$t$($v$ = {nu:.1f})")
+
+    ax.set_title(title or f"GARCH standardized residuals vs innovation PDF ({dist})")
+    ax.set_xlabel("Standardized residual")
+    ax.set_ylabel("Density")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    plt.show()
+
+
+# -------------------- orchestration --------------------
+def fit_return_models(
+    returns: pd.Series,
+    run_normal: bool = True,
+    run_t: bool = True,
+    run_garch_normal: bool = True,
+    run_garch_t: bool = True
+) -> dict:
+    """
+    Fit Normal, Student-t, GARCH-Normal, and GARCH-t to a returns series.
+
+    Returns a dict with each model’s parameter dict and a 'comparison'
+    DataFrame ranked by BIC (lower is better).
+    """
+    results = {}
+    if run_normal:
+        results["normal"] = fit_normal(returns)
+    if run_t:
+        results["t"] = fit_tstudent(returns)
+    if run_garch_normal:
+        results["garch_normal"] = fit_garch(returns, dist="normal")
+    if run_garch_t:
+        results["garch_t"] = fit_garch(returns, dist="t")
+
+    comp = []
+    for k, v in results.items():
+        comp.append({"model": k, "aic": v["aic"], "bic": v["bic"], "loglik": v["loglik"]})
+    results["comparison"] = pd.DataFrame(comp).sort_values("bic").reset_index(drop=True)
+    return results
+
+
+
+
+def fit_models_from_panel(
+    panel: pd.DataFrame,
+    ticker: str | None = None,
+    run_normal: bool = True,
+    run_t: bool = True,
+    run_garch_normal: bool = True,
+    run_garch_t: bool = True
+) -> dict:
+    """
+    Adapters to run distribution and GARCH fits directly on the 'panel' returned
+    by `download_analyze_with_metrics` function.
+
+    Convenience wrapper:
+    - If `ticker` is provided: fits on that ticker's return series.
+    - If `ticker` is None: fits each ticker found in `panel['ticker']` and
+      returns a dict-of-dicts plus a comparison table per ticker.
+
+    Returns
+    -------
+    If ticker is not None:
+        dict with keys: {"normal", "t", "garch_normal", "garch_t", "comparison"}
+    Else:
+        dict mapping each ticker -> same dict as above.
+    """
+    required_cols = {"ticker", "date", "return"}
+    if not required_cols.issubset(set(panel.columns)):
+        missing = required_cols - set(panel.columns)
+        raise ValueError(f"`panel` must contain columns {required_cols}. Missing: {missing}")
+
+    def _fit_one(_series: pd.Series) -> dict:
+        _series = pd.Series(_series).dropna()
+        return fit_return_models(
+            returns=_series,
+            run_normal=run_normal,
+            run_t=run_t,
+            run_garch_normal=run_garch_normal,
+            run_garch_t=run_garch_t
+        )
+
+    if ticker is not None:
+        s = (panel.loc[panel["ticker"] == ticker]
+                   .sort_values("date")["return"]
+                   .astype(float)
+                   .dropna())
+        if s.empty:
+            raise ValueError(f"No returns found for ticker '{ticker}'.")
+        return _fit_one(s)
+
+    # Fit all tickers
+    results = {}
+    for t, sub in panel.groupby("ticker", sort=True):
+        s = sub.sort_values("date")["return"].astype(float).dropna()
+        if s.empty:
+            continue
+        try:
+            results[t] = _fit_one(s)
+        except Exception as e:
+            results[t] = {"error": str(e)}
+    return results
+
+#---------------splines-----------------#
+
+def spline_density_from_hist(returns: pd.Series | np.ndarray,
+                             bins: int = 60,
+                             k: int = 3,
+                             s: float | None = None,
+                             x_points: int = 1000):
+    """
+    Fit a smoothing spline to the histogram density of returns.
+    Ensures non-negativity and re-normalizes to integrate to 1.
+
+    Parameters
+    ----------
+    returns : array-like
+        Return series.
+    bins : int
+        Number of histogram bins (density=True).
+    k : int
+        Spline degree (1..5). Use 3 for cubic.
+    s : float or None
+        Smoothing factor; higher s = smoother. If None, UnivariateSpline chooses.
+    x_points : int
+        Number of evaluation points for the spline PDF.
+
+    Returns
+    -------
+    xs : np.ndarray
+        Grid for plotting the spline PDF.
+    pdf_spline : np.ndarray
+        Spline-smoothed density, nonnegative, integrates to 1.
+    spline_fun : callable
+        The (non-clipped, non-renormalized) spline function before post-processing.
+    (bin_centers, hist_density) : tuple of arrays (for diagnostics)
+    """
+    r = np.asarray(pd.Series(returns).dropna().values)
+    # Histogram as density
+    counts, bin_edges = np.histogram(r, bins=bins, density=True)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    hist_density = counts
+
+    # Fit smoothing spline on (centers, density)
+    spline = UnivariateSpline(bin_centers, hist_density, k=k, s=s)
+
+    # Evaluate on a fine grid
+    xs = np.linspace(bin_edges.min(), bin_edges.max(), x_points)
+    pdf = spline(xs)
+
+    # Enforce non-negativity and renormalize to integrate to 1
+    pdf = np.clip(pdf, 0.0, np.inf)
+    area = np.trapz(pdf, xs)
+    if area > 0:
+        pdf /= area
+
+    return xs, pdf, spline, (bin_centers, hist_density)
+
+# --- Example usage + plot
+def plot_hist_with_spline(returns, bins=60, k=3, s=None, title="Histogram + spline PDF"):
+    xs, pdf_spline, spline_fun, (centers, dens) = spline_density_from_hist(
+        returns, bins=bins, k=k, s=s, x_points=1200
+    )
+
+    plt.figure(figsize=(9,5))
+    plt.hist(returns, bins=bins, density=True, alpha=0.35, label="Returns (hist)")
+    plt.plot(xs, pdf_spline, linewidth=2, label=f"Spline PDF (k={k}, s={s})")
+    # optional: show the raw histogram points used for fitting
+    plt.scatter(centers, dens, s=10, alpha=0.7, label="Hist density points")
+    plt.title(title)
+    plt.xlabel("Return"); plt.ylabel("Density")
+    plt.grid(True, alpha=0.25); plt.legend()
+    plt.show()
+
+#---------------KDE-----------------#
+
+def kde_density(returns, x_points=1000, bw_method="scott"):
+    r = np.asarray(pd.Series(returns).dropna().values)
+    kde = gaussian_kde(r, bw_method=bw_method)  # 'scott' or 'silverman' or float
+    xs = np.linspace(np.percentile(r, 0.5), np.percentile(r, 99.5), x_points)
+    pdf = kde(xs)
+    # Already nonnegative and integrates ~1 over R; no need to renormalize on [xs]
+    return xs, pdf, kde
+
+def plot_hist_with_kde(returns, bins=60, bw_method="scott", title="Histogram + KDE"):
+    xs, pdf_kde, _ = kde_density(returns, x_points=1200, bw_method=bw_method)
+    plt.figure(figsize=(9,5))
+    plt.hist(returns, bins=bins, density=True, alpha=0.35, label="Returns (hist)")
+    plt.plot(xs, pdf_kde, linewidth=2, label=f"KDE (bw={bw_method})")
+    plt.title(title)
+    plt.xlabel("Return"); plt.ylabel("Density")
+    plt.grid(True, alpha=0.25); plt.legend()
     plt.show()
