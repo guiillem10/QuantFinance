@@ -13,22 +13,29 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import StrMethodFormatter
+from scipy import stats
 from scipy.stats import norm as _norm
 from scipy.stats import t as _t
 from scipy.optimize import minimize
-# GARCH (arch)
+from scipy.stats import gaussian_kde
+from scipy.interpolate import UnivariateSpline
 try:
     from arch.univariate import ConstantMean, GARCH, Normal, StudentsT
     _HAS_ARCH = True
 except Exception:
     _HAS_ARCH = False
-# Optional SciPy for parametric VaR/CVaR
 try:
     from scipy.stats import norm
 except Exception:
     norm = None
-from scipy.stats import gaussian_kde
-from scipy.interpolate import UnivariateSpline
+try:
+    from statsmodels.graphics.tsaplots import plot_acf
+except Exception as _e:
+    plot_acf = None
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+
 ##########################################    
 #NEW: AUTHOMATIC FINANCIAL COMMENTARY!   #
 ##########################################
@@ -279,14 +286,29 @@ def download_analyze_with_metrics(
     panel.index.set_names(["date", "ticker"], inplace=True)
     panel = panel.reset_index().sort_values(["ticker", "date"])
 
-    # --- 5) Benchmark (optional)
+        # --- 5) Benchmark (optional)
     bm = None
+    bm_panel = None      # NEW
+    bm_label = None      # NEW
     if benchmark:
         bm_raw = yf.download(benchmark, start=start_date, progress=False, auto_adjust=auto_adjust)
-        bm_px = _extract_close(bm_raw, benchmark).iloc[:, 0]
+        bm_px = _extract_close(bm_raw, benchmark).iloc[:, 0]              # prices (Series)
         bm_px = _clean_prices(bm_px.to_frame(), max_ffill=max_ffill).iloc[:, 0]
-        bm = _compute_returns(bm_px.to_frame(), method=return_method).iloc[:, 0]
-        bm = bm.reindex(px.index).rename("bm_return")
+
+        bm_px_aligned = bm_px.reindex(px.index)
+
+        bm = _compute_returns(bm_px_aligned.to_frame(), method=return_method).iloc[:, 0]
+        bm = bm.rename("bm_return") 
+
+        
+        bm_label = str(benchmark)   
+        bm_panel = pd.DataFrame({
+            "date": bm_px_aligned.index,
+            "ticker": bm_label,
+            "price": bm_px_aligned.values,
+            "return": bm.reindex(px.index).values
+        })
+
 
     # --- 6) 
     metrics = []
@@ -419,6 +441,9 @@ def download_analyze_with_metrics(
         rolling[w] = {"vol": vol, "sharpe": sharpe_roll}
 
     extras = {"drawdowns": drawdowns, "correlation_matrix": corr_mat, "rolling": rolling}
+    if bm_panel is not None:
+        extras["benchmark_panel"] = bm_panel
+        extras["benchmark_label"] = bm_label
 
     # --- 8) Build tidy panel with metrics (optional join)
     panel = panel.merge(
@@ -544,6 +569,104 @@ def plot_prices(data: pd.DataFrame,
     plt.tight_layout()
     plt.show()
 
+def compute_tracking_metrics(
+    panel: pd.DataFrame,
+    extras: dict,
+    tickers: list | None = None,
+    periods_per_year: int = 252,
+    min_overlap: int = 30,
+) -> pd.DataFrame:
+    """
+    Compute Tracking Error (TE) and Tracking Difference (TD) vs the benchmark provided
+    by download_analyze_with_metrics (via extras["benchmark_panel"]).
+
+    Parameters
+    ----------
+    panel : tidy DataFrame with columns ['date','ticker','price','return', ...]
+    extras : dict from download_analyze_with_metrics; must contain 'benchmark_panel'
+    tickers : list or None
+        If None, use all tickers in panel (excluding the benchmark label, if present).
+    periods_per_year : int
+        Annualization factor (252 for daily).
+    min_overlap : int
+        Minimum overlapping days required to compute metrics.
+
+    Returns
+    -------
+    pd.DataFrame with one row per ticker:
+        ['ticker','n_overlap','start','end',
+         'td_daily','td_annual','te_daily','te_annual']
+    Notes
+    -----
+    TD (tracking difference) is the mean of active returns (ETF - benchmark).
+    TE (tracking error) is the standard deviation of active returns.
+    Annualization uses:
+        td_annual   = td_daily * periods_per_year
+        te_annual   = te_daily * sqrt(periods_per_year)
+    """
+    if not isinstance(extras, dict) or "benchmark_panel" not in extras:
+        raise ValueError("extras must contain 'benchmark_panel' with columns ['date','ticker','price','return'].")
+
+    bm_panel = extras["benchmark_panel"]
+    bm_series = (
+        bm_panel[["date", "return"]]
+        .dropna()
+        .assign(date=pd.to_datetime(bm_panel["date"]))
+        .set_index("date")["return"]
+        .astype(float)
+        .rename("bm")
+    )
+
+    # Default: all tickers in panel except the benchmark label (if included there)
+    if tickers is None:
+        all_tickers = sorted(pd.unique(panel["ticker"]))
+        bench_label = extras.get("benchmark_label")
+        tickers = [t for t in all_tickers if (bench_label is None or t != bench_label)]
+
+    rows = []
+    for t in tickers:
+        s = (
+            panel.loc[panel["ticker"] == t, ["date", "return"]]
+            .dropna()
+            .assign(date=pd.to_datetime(panel.loc[panel["ticker"] == t, "date"]))
+            .set_index("date")["return"]
+            .astype(float)
+            .rename("asset")
+        )
+        df = pd.concat([s, bm_series], axis=1, join="inner").dropna()
+        if df.shape[0] < min_overlap:
+            rows.append({
+                "ticker": t, "n_overlap": df.shape[0],
+                "start": df.index.min(), "end": df.index.max(),
+                "td_daily": np.nan, "td_annual": np.nan,
+                "te_daily": np.nan, "te_annual": np.nan
+            })
+            continue
+
+        active = df["asset"] - df["bm"]
+        td_daily = float(active.mean())
+        te_daily = float(active.std(ddof=0))  # MLE std, consistent with many index factsheets
+        td_annual = td_daily * periods_per_year
+        te_annual = te_daily * np.sqrt(periods_per_year)
+
+        var_b = float(df["bm"].var(ddof=0))
+        rows.append({
+            "ticker": t,
+            "n_overlap": df.shape[0],
+            "start": df.index.min(),
+            "end": df.index.max(),
+            "td_daily": td_daily,
+            "td_annual": td_annual,
+            "te_daily": te_daily,
+            "te_annual": te_annual
+        })
+
+    out = pd.DataFrame(rows)
+    # Nice ordering
+    cols = ["ticker","n_overlap","start","end","td_daily","td_annual","te_daily","te_annual"]
+    return out[cols].sort_values("te_annual")
+
+
 # -----------------------------
 # 1) Returns plot
 # -----------------------------
@@ -635,14 +758,14 @@ def plot_returns(data: pd.DataFrame,
 
         # Centrar la vista en la media (opcional)
         x_range = ax.get_xlim()
-        span = max(abs(x_range[1] - mu), abs(mu - x_range[0]))
+        span = max(abs(x_range[1] - mu), abs(mu - x_range[0])) / 2
         ax.set_xlim(mu - span, mu + span)
 
         # En histogramas, no queremos formatear eje X como fechas
         base = "Histogram of returns"
 
         # Evitamos formateadores de fechas para el histograma
-        ax.xaxis.set_major_locator(plt.MaxNLocator(10))
+        ax.xaxis.set_major_locator(plt.MaxNLocator(20))
         ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.2%}"))
 
     else:
@@ -1076,3 +1199,316 @@ def plot_hist_with_kde(returns, bins=60, bw_method="scott", title="Histogram + K
     plt.xlabel("Return"); plt.ylabel("Density")
     plt.grid(True, alpha=0.25); plt.legend()
     plt.show()
+
+#---------------Advanced Plot Gaussian Model------------------------#
+
+def _extract_returns_from_input(panel_or_tuple_or_df, ticker: str | None = None) -> pd.Series:
+    """
+    Accepts:
+      1) Full 4-tuple from `download_analyze_with_metrics` -> uses element [0] (panel)
+      2) The tidy `panel` DataFrame with ['date','ticker','return']
+      3) A wide returns DataFrame (DatetimeIndex rows, tickers columns)
+      4) A 1D Series of returns
+    Returns a pd.Series of returns (name=ticker if available).
+    """
+    # Case 1: user passed the full tuple
+    if isinstance(panel_or_tuple_or_df, tuple) and len(panel_or_tuple_or_df) >= 1:
+        panel_or_tuple_or_df = panel_or_tuple_or_df[0]
+
+    # Case 2: tidy panel
+    if isinstance(panel_or_tuple_or_df, pd.DataFrame) and {"date","ticker","return"}.issubset(panel_or_tuple_or_df.columns):
+        panel = panel_or_tuple_or_df
+        if ticker is None:
+            uniq = panel["ticker"].dropna().unique()
+            if len(uniq) != 1:
+                raise ValueError("Multiple tickers in panel; please pass `ticker=` explicitly.")
+            ticker = str(uniq[0])
+        s = (panel.loc[panel["ticker"] == ticker]
+                    .sort_values("date")["return"].astype(float).dropna())
+        s.name = ticker
+        s.index = pd.to_datetime(panel.loc[panel["ticker"] == ticker, "date"])[: len(s)]
+        return s
+
+    # Case 3: wide returns
+    if isinstance(panel_or_tuple_or_df, pd.DataFrame) and isinstance(panel_or_tuple_or_df.index, pd.DatetimeIndex):
+        df = panel_or_tuple_or_df.sort_index()
+        if ticker is None:
+            if df.shape[1] != 1:
+                raise ValueError("Wide DataFrame has multiple columns; pass `ticker=` or a single-column DataFrame.")
+            ticker = df.columns[0]
+        s = df[ticker].dropna().astype(float)
+        s.name = ticker
+        return s
+
+    # Case 4: already a Series
+    if isinstance(panel_or_tuple_or_df, pd.Series):
+        s = pd.Series(panel_or_tuple_or_df).dropna().astype(float)
+        try:
+            s.index = pd.to_datetime(s.index)
+        except Exception:
+            pass
+        return s
+
+    # As a convenience: if a tidy *price* panel slipped in, convert via utils helper
+    if isinstance(panel_or_tuple_or_df, pd.DataFrame) and ("price" in panel_or_tuple_or_df.columns):
+        wide_rets = _to_wide_returns(panel_or_tuple_or_df)
+        return _extract_returns_from_input(wide_rets, ticker=ticker)
+
+    raise TypeError("Unsupported input; pass the tuple or panel from download_analyze_with_metrics, a wide returns DataFrame, or a Series.")
+
+
+def gaussian_qq_acf_diagnostics(
+    data,
+    ticker: str | None = None,
+    *,
+    bins: int = 60,
+    fit_mean_var: bool = True,
+    acf_lags: int = 30,
+    figsize_hist_qq=(16, 6),
+    figsize_acf=(16, 6),
+):
+    """
+    Produce Gaussian diagnostics akin to `tests_gaussian_white_noise`:
+      - Figure 1: Histogram + Normal PDF (with fitted mu/sigma or N(0,1)) and QQ-plot.
+      - Figure 2: ACF of returns and ACF of absolute returns.
+
+    Parameters
+    ----------
+    data : tuple | DataFrame | Series
+        Output of `download_analyze_with_metrics` (tuple or its `panel`),
+        a wide returns DataFrame, or a 1D Series of returns.
+    ticker : str, optional
+        Needed when multiple tickers are present.
+    bins : int
+        Histogram bins.
+    fit_mean_var : bool
+        If True, estimate mu and sigma from the sample; else use N(0,1).
+    acf_lags : int
+        Number of lags for ACF plots.
+    figsize_hist_qq : tuple
+        Size of the (histogram, QQ) figure.
+    figsize_acf : tuple
+        Size of the (ACF, |.| ACF) figure.
+
+    Returns
+    -------
+    (fig1, fig2)
+        Matplotlib figures (hist+QQ, ACFs). Axes can be accessed via fig.axes.
+    """
+    r = _extract_returns_from_input(data, ticker=ticker)
+    if r.empty:
+        raise ValueError("No returns to analyze.")
+    noise = r.values.astype(float)
+
+    # Fit or set Normal parameters
+    if fit_mean_var:
+        mu = float(np.mean(noise))
+        sigma = float(np.std(noise, ddof=0))
+    else:
+        mu, sigma = 0.0, 1.0
+
+    if sigma <= 0 or not np.isfinite(sigma):
+        raise ValueError("Non-positive or invalid sigma; cannot run Gaussian diagnostics.")
+
+    # --- Figure 1: Histogram+PDF and QQ-plot ---
+    fig1, axs = plt.subplots(1, 2, figsize=figsize_hist_qq, sharex=False)
+
+    # Histogram + PDF
+    axs[0].hist(noise, bins=bins, density=True, alpha=0.35, label="Returns")
+    xs = np.linspace(np.percentile(noise, 0.1), np.percentile(noise, 99.9), 800)
+    axs[0].plot(xs, stats.norm.pdf(xs, loc=mu, scale=sigma), linewidth=2.0,
+                label=f"Normal PDF (mu={mu:.4g}, sigma={sigma:.4g})")
+    axs[0].set_title("Histogram with Normal PDF")
+    axs[0].set_xlabel("Return"); axs[0].set_ylabel("Density")
+    axs[0].grid(True, alpha=0.25); axs[0].legend(frameon=False)
+
+    # QQ-plot (probplot) against Normal(mu, sigma)
+    stats.probplot(noise, sparams=(mu, sigma), dist='norm', plot=axs[1])
+    axs[1].set_title("Normal QQ-plot")
+    axs[1].grid(True, alpha=0.25)
+
+    fig1.tight_layout()
+
+    # --- Figure 2: ACFs (returns and absolute returns) ---
+    fig2 = None
+    if plot_acf is not None:
+        fig2, axs2 = plt.subplots(1, 2, figsize=figsize_acf, sharex=True, sharey=True)
+        plot_acf(noise, lags=acf_lags, ax=axs2[0])
+        plot_acf(np.abs(noise), lags=acf_lags, ax=axs2[1])
+        axs2[0].set_title('ACF of returns.')
+        axs2[0].set_xlabel(r'$\tau$'); axs2[0].set_ylabel(r'$\rho(\tau)$')
+        axs2[1].set_title('ACF of absolute returns.')
+        axs2[1].set_xlabel(r'$\tau$'); axs2[1].set_ylabel(r'$\rho(\tau)$')
+        fig2.tight_layout()
+    else:
+        print("statsmodels is not available; skipping ACF plots. Install via `pip install statsmodels`.")
+
+    return fig1, fig2
+
+#---------------------Advanced Plot t-Student Model---------------------#
+def student_t_qq_acf_diagnostics(
+    data,
+    ticker: str | None = None,
+    *,
+    bins: int = 60,
+    acf_lags: int = 30,
+    figsize_hist_qq=(16, 6),
+    figsize_acf=(16, 6),
+):
+    r = _extract_returns_from_input(data, ticker=ticker)
+    if r.empty:
+        raise ValueError("No returns to analyze.")
+    noise = r.values.astype(float)
+
+    # Fit Student-t parameters
+    fit = fit_tstudent(r)
+    nu, mu, sigma = fit["nu"], fit["mu"], fit["sigma"]
+
+    fig1, axs = plt.subplots(1, 2, figsize=figsize_hist_qq)
+
+    axs[0].hist(noise, bins=bins, density=True, alpha=0.35, label="Returns")
+    xs = np.linspace(np.percentile(noise, 0.1), np.percentile(noise, 99.9), 800)
+    axs[0].plot(xs, stats.t.pdf(xs, df=nu, loc=mu, scale=sigma), linewidth=2.0,
+                label=f"t PDF (nu={nu:.2f}, mu={mu:.4g}, sigma={sigma:.4g})")
+    axs[0].set_title("Histogram with Student-t PDF")
+    axs[0].set_xlabel("Return"); axs[0].set_ylabel("Density")
+    axs[0].grid(True, alpha=0.25); axs[0].legend(frameon=False)
+
+    stats.probplot(noise, sparams=(nu, mu, sigma), dist='t', plot=axs[1])
+    axs[1].set_title("Student-t QQ-plot")
+    axs[1].grid(True, alpha=0.25)
+    fig1.tight_layout()
+
+    fig2 = None
+    if plot_acf is not None:
+        fig2, axs2 = plt.subplots(1, 2, figsize=figsize_acf, sharex=True, sharey=True)
+        plot_acf(noise, lags=acf_lags, ax=axs2[0])
+        plot_acf(np.abs(noise), lags=acf_lags, ax=axs2[1])
+        axs2[0].set_title('ACF of returns')
+        axs2[1].set_title('ACF of absolute returns')
+        fig2.tight_layout()
+    else:
+        print("statsmodels not available; skipping ACF plots.")
+
+    return fig1, fig2
+
+def garch_diagnostics(
+    data,
+    ticker: str | None = None,
+    *,
+    dist: str = "t",                   # 't' or 'normal'
+    acf_lags: int = 30,
+    bins: int = 60,
+    periods_per_year: int = 252,
+    figsize_resid_qq=(16, 6),
+    figsize_acf=(16, 6),
+    figsize_vol=(16, 4),
+):
+    """
+    Fit a GARCH(1,1) and produce diagnostics analogous to the Gaussian/Student‑t helpers.
+
+    Parameters
+    ----------
+    data : tuple | DataFrame | Series
+        Output from `download_analyze_with_metrics` (tuple or `panel`),
+        a wide returns DataFrame, or a 1D returns Series.
+    ticker : str, optional
+        Required when `data` contains multiple tickers.
+    dist : {'t','normal'}
+        Innovation distribution for the GARCH model.
+    acf_lags : int
+        Number of lags for ACF plots.
+    bins : int
+        Histogram bins for standardized residuals.
+    periods_per_year : int
+        Used to annualize conditional volatility in the third figure.
+
+    Returns
+    -------
+    (fig1, fig2, fig3, res)
+        Matplotlib figures for (resid hist+QQ), (ACFs), (cond. vol) and the fitted ARCH result object.
+    """
+    if not _HAS_ARCH:
+        raise ImportError("Package 'arch' is required. Install with: pip install arch")
+
+    r = _extract_returns_from_input(data, ticker=ticker)
+    if r.empty:
+        raise ValueError("No returns to analyze.")
+
+    # Fit GARCH(1,1) with ConstantMean on scaled returns (common for arch)
+    scale = 100.0
+    y = (r.values * scale).astype(float)
+
+    am = ConstantMean(y)
+    am.volatility = GARCH(p=1, q=1)
+    if dist.lower() in {"t", "student", "students_t"}:
+        am.distribution = StudentsT()
+        dist_key = "t"
+    elif dist.lower() in {"n", "norm", "normal"}:
+        am.distribution = Normal()
+        dist_key = "normal"
+    else:
+        raise ValueError("dist must be 't' or 'normal'.")
+
+    res = am.fit(disp="off")
+
+    # Standardized residuals and conditional volatility (back to original scale)
+    z = pd.Series(res.std_resid, index=r.index).dropna()           # standardized resid
+    cond_vol = pd.Series(res.conditional_volatility / scale, index=r.index).dropna()
+    cond_vol_ann = cond_vol * np.sqrt(periods_per_year)
+
+    # ----- Figure 1: histogram + innovation PDF, and QQ-plot -----
+    fig1, axs = plt.subplots(1, 2, figsize=figsize_resid_qq)
+    axs[0].hist(z.values, bins=bins, density=True, alpha=0.35, label="Std. residuals")
+
+    xs = np.linspace(np.percentile(z, 0.1), np.percentile(z, 99.9), 1000)
+    if dist_key == "normal":
+        axs[0].plot(xs, stats.norm.pdf(xs, loc=0, scale=1), linewidth=2.0, label="N(0,1)")
+        stats.probplot(z.values, dist=stats.norm, plot=axs[1])
+    else:
+        # Use fitted nu from result if available; otherwise estimate from z
+        try:
+            nu = float(res.params.get("nu", np.nan))
+        except Exception:
+            nu = np.nan
+        if not np.isfinite(nu):
+            # Fallback quick fit for df given z ~ t(0,1)
+            nu = max(2.01, stats.t.fit(z.values, floc=0, fscale=1)[0])
+        axs[0].plot(xs, stats.t.pdf(xs, df=nu, loc=0, scale=1), linewidth=2.0, label=f"t(df={nu:.1f})")
+        stats.probplot(z.values, sparams=(nu,), dist=stats.t, plot=axs[1])
+
+    axs[0].set_title("Std. residuals: histogram vs innovation PDF")
+    axs[0].set_xlabel("$z_t$"); axs[0].set_ylabel("Density")
+    axs[0].grid(True, alpha=0.25); axs[0].legend(frameon=False)
+
+    axs[1].set_title(f"QQ-plot vs {('Normal' if dist_key=='normal' else 'Student-t')} innovations")
+    axs[1].grid(True, alpha=0.25)
+    fig1.tight_layout()
+
+    # ----- Figure 2: ACFs -----
+    fig2 = None
+    if plot_acf is not None:
+        fig2, axs2 = plt.subplots(1, 2, figsize=figsize_acf, sharex=True, sharey=True)
+        plot_acf(z.values, lags=acf_lags, ax=axs2[0])
+        plot_acf((z.values ** 2), lags=acf_lags, ax=axs2[1])
+        axs2[0].set_title("ACF of standardized residuals $z_t$")
+        axs2[1].set_title("ACF of squared residuals $z_t^2$")
+        for ax in axs2:
+            ax.set_xlabel("lag"); ax.set_ylabel("corr"); ax.grid(True, alpha=0.2)
+        fig2.tight_layout()
+    else:
+        print("statsmodels not available; skipping ACF plots.")
+
+    # ----- Figure 3: Conditional volatility (annualized) -----
+    if dist_key == "normal":
+        fig3, ax3 = plt.subplots(1, 1, figsize=figsize_vol)
+        ax3.plot(cond_vol_ann.index, cond_vol_ann.values, linewidth=1.4)
+        ax3.set_title("GARCH(1,1) conditional volatility (annualized)")
+        ax3.set_xlabel("Date"); ax3.set_ylabel("Volatility (ann.)")
+        ax3.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        return fig1, fig2, fig3, res
+    
+    else:
+        return fig1, fig2, res
+
