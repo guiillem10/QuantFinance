@@ -13,8 +13,11 @@ A compact, production-ready portfolio that combines a **reusable Python utility 
 ## 📁 Repository layout
 
 ├── sustainable_alpha_esg_etfs_analysis.ipynb # Research notebook (US & EU ESG ETFs)
+
 ├── utils.py # Reusable analytics & plotting utilities
+
 ├── Time_series.pdf # Theory note: stochastic & time-series foundations
+
 └── stylized_facts_of_time_series.pdf # Stylized facts companion (empirical properties)
 
 
@@ -192,5 +195,6 @@ Data is © respective providers. You are responsible for complying with Yahoo Fi
 If you use this work, please reference Sustainable Alpha — ESG ETFs (US & EU) and include a link to the repository.
 
 🙋 Author
+
 
 Guillem Borràs — MSc Quantitative Finance · Physicist · Quantum Computing (IBM).
