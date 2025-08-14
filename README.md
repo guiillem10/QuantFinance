@@ -12,13 +12,10 @@ A compact, production-ready portfolio that combines a **reusable Python utility 
 
 ## 📁 Repository layout
 
-├── sustainable_alpha_esg_etfs_analysis.ipynb # Research notebook (US & EU ESG ETFs)
-
-├── utils.py # Reusable analytics & plotting utilities
-
-├── Time_series.pdf # Theory note: stochastic & time-series foundations
-
-└── stylized_facts_of_time_series.pdf # Stylized facts companion (empirical properties)
+├──sustainable_alpha_esg_etfs_analysis.ipynb # Research notebook (US & EU ESG ETFs)
+├──utils.py # Reusable analytics & plotting utilities
+├──Time_series.pdf # Theory note: stochastic & time-series foundations
+└──stylized_facts_of_time_series.pdf # Stylized facts companion (empirical properties)
 
 
 ---
