@@ -138,8 +138,9 @@ print(te_df)
 gaussian_qq_acf_diagnostics(panel_us, ticker="ESGU")
 student_t_qq_acf_diagnostics(panel_us, ticker="ESGU")
 garch_diagnostics(panel_us, ticker="ESGU", dist="t")
+```
 
-🧪 Methodological notes
+## 🧪 Methodological notes
 
 Stylized facts checked: (i) negligible linear autocorrelation of returns; (ii) volatility clustering; (iii) heavy tails; (iv) non-Gaussian standardized residuals under homoskedastic models; (v) improved fit under t-innovations and GARCH with persistent volatility.
 
@@ -149,7 +150,7 @@ Benchmarking: CAPM beta/alpha & correlation vs regional benchmark; TD/TE on alig
 
 Rolling analytics: rolling annualized volatility and Sharpe over configurable windows (e.g., 63/126/252 trading days).
 
-📦 Requirements
+## 📦 Requirements
 
 Core: numpy, pandas, yfinance, matplotlib, scipy
 
@@ -159,7 +160,7 @@ Python: 3.10+ (developed on 3.13)
 
 Install: pip install numpy pandas yfinance matplotlib scipy statsmodels arch
 
-🔁 Reproducibility & data
+## 🔁 Reproducibility & data
 
 Data source: Yahoo Finance via yfinance (free, unaudited; subject to revisions/outages).
 
@@ -169,7 +170,7 @@ Dates: Default start date 2018-01-01. Adjust to your analysis horizon.
 
 Note: Metrics are sensitive to data-cleaning choices (e.g., winsorization, forward-fills). The helpers expose these knobs for transparency.
 
-📈 How to extend
+## 📈 How to extend
 
 Add new ETFs or regions by editing the ticker lists.
 
@@ -179,7 +180,7 @@ Swap benchmarks (e.g., MSCI Europe) or add FX overlays for cross-currency views.
 
 Persist results (CSV/Parquet) or automate reporting (e.g., nbconvert, GitHub Actions).
 
-🤝 How to use this as a portfolio
+## 🤝 How to use this as a portfolio
 
 Keep the repo lean (one utils.py, one flagship notebook, two crisp PDFs).
 
@@ -187,14 +188,15 @@ Pin results with a fixed end date and commit figures (optional) for recruiter-fr
 
 Add a short “Key Findings” section to the notebook output if targeting non-quant stakeholders.
 
-📝 License & attribution
+## 📝 License & attribution
 
 This repository is provided for research and educational purposes. No investment advice is given.
 Data is © respective providers. You are responsible for complying with Yahoo Finance’s terms of use.
 
 If you use this work, please reference Sustainable Alpha — ESG ETFs (US & EU) and include a link to the repository.
 
-🙋 Author
+## 🙋 Author
 
 
-Guillem Borràs — MSc Quantitative Finance · Physicist · Quantum Computing (IBM).
+### Guillem Borràs — MSc Quantitative Finance · Physicist · Quantum Computing (IBM).
+
