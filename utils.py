@@ -1511,4 +1511,3 @@ def garch_diagnostics(
     
     else:
         return fig1, fig2, res
-
